@@ -1,0 +1,162 @@
+# Build an UNSIGNED iOS .ipa for sideloading.
+#
+# The archive is produced with `flutter build ios --no-codesign`, so it is NOT
+# installable straight from Safari. Re-sign it on the target device with
+# Sideloadly / AltStore / TrollStore before installing.
+#
+# No Apple Developer secrets are required. The single optional secret is
+# `DOTENV_RELEASE`; when it is absent the Dart CLI's `bootstrap()` writes a
+# sane default `.env`.
+#
+# Build logic lives in `cli/commands/build/ios.dart` — this workflow only
+# provisions the toolchain and publishes the result, so the build stays a
+# single source of truth shared with local builds.
+
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        type: choice
+        options:
+          - stable
+          - nightly
+        default: nightly
+        description: Release channel baked into the build
+      release:
+        type: boolean
+        default: false
+        description: Attach the .ipa to a GitHub Release
+      debug:
+        type: boolean
+        default: false
+        description: Open an SSH debug session if the build fails
+
+# Toolchain versions are pinned here and consumed by both the setup actions and
+# the Dart CLI (`CliEnv.flutterVersion` dereferences FLUTTER_VERSION and will
+# throw if it is unset).
+env:
+  FLUTTER_VERSION: 3.35.2
+  FLUTTER_CHANNEL: stable
+  IPA_ARTIFACT_DIR: dist
+
+permissions:
+  contents: read
+
+# macOS runners are the scarcest resource in the pool; never queue two builds
+# of the same ref against each other.
+concurrency:
+  group: build-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_ios:
+    name: Build unsigned IPA (${{ inputs.channel }})
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      # Required only by the optional release step below.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2.18.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: false
+          git-source: https://github.com/flutter/flutter.git
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # The iOS target triple is added by `install-dependencies` below so
+          # that local and CI builds share one definition.
+          toolchain: stable
+
+      - name: Report toolchain versions
+        run: |
+          flutter --version
+          rustc --version
+          xcodebuild -version
+          pod --version
+
+      - name: Install iOS dependencies
+        run: |
+          flutter pub get
+          dart cli/cli.dart install-dependencies --platform=ios
+
+      - name: Resolve build metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          # BSD awk on macOS has no `grep -P`; split on space and '+' instead.
+          version="$(awk -F'[ +]' '/^version:/ {print $2; exit}' pubspec.yaml)"
+          if [ -z "${version}" ]; then
+            echo "::error::Could not parse 'version:' from pubspec.yaml"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "ipa_name=Spotube-iOS-${version}-${{ inputs.channel }}.ipa" >> "$GITHUB_OUTPUT"
+
+      - name: Build unsigned IPA
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          DOTENV: ${{ secrets.DOTENV_RELEASE }}
+        run: dart cli/cli.dart build ios
+
+      - name: Verify and stage artifact
+        run: |
+          set -euo pipefail
+          if [ ! -f Spotube-iOS.ipa ]; then
+            echo "::error::Spotube-iOS.ipa was not produced by the build"
+            ls -la build/ios/iphoneos || true
+            exit 1
+          fi
+
+          # An .ipa is only valid if it contains exactly one Payload/*.app bundle.
+          # Match on the path component rather than a directory entry: `zip` is
+          # not guaranteed to emit an explicit `Payload/<flavor>.app/` entry.
+          app_count="$(unzip -Z1 Spotube-iOS.ipa | awk -F/ '$1 == "Payload" && $2 ~ /\.app$/ {print $2}' | sort -u | wc -l | tr -d ' ')"
+          if [ "${app_count}" != "1" ]; then
+            echo "::error::Expected exactly 1 app bundle under Payload/, found ${app_count}"
+            unzip -Z1 Spotube-iOS.ipa | head -n 20
+            exit 1
+          fi
+
+          mkdir -p "${IPA_ARTIFACT_DIR}"
+          mv Spotube-iOS.ipa "${IPA_ARTIFACT_DIR}/${{ steps.meta.outputs.ipa_name }}"
+          cd "${IPA_ARTIFACT_DIR}"
+          shasum -a 256 "${{ steps.meta.outputs.ipa_name }}" > "${{ steps.meta.outputs.ipa_name }}.sha256"
+          ls -lh
+          cat "${{ steps.meta.outputs.ipa_name }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-${{ inputs.channel }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ env.IPA_ARTIFACT_DIR }}/*.ipa
+            ${{ env.IPA_ARTIFACT_DIR }}/*.sha256
+
+      - name: Attach IPA to release
+        if: ${{ inputs.release }}
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # stable releases are tagged v<pubspec version>; nightlies reuse the
+          # rolling `nightly` tag, matching spotube-release-binary.yml.
+          tag: ${{ inputs.channel == 'stable' && format('v{0}', steps.meta.outputs.version) || 'nightly' }}
+          omitBodyDuringUpdate: true
+          omitNameDuringUpdate: true
+          omitPrereleaseDuringUpdate: true
+          allowUpdates: true
+          artifacts: ${{ env.IPA_ARTIFACT_DIR }}/*
+
+      - name: Open SSH Debug Session On Failure
+        if: ${{ failure() && inputs.debug }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
