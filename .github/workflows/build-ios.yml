@@ -100,6 +100,32 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "ipa_name=Spotube-iOS-${version}-${{ inputs.channel }}.ipa" >> "$GITHUB_OUTPUT"
 
+      # TEMPORARY. `ios/Podfile.lock` pins sqlite3 3.50.4, recorded when an
+      # older sqlite3_flutter_libs was resolved. `pubspec.lock` now pins
+      # sqlite3_flutter_libs 0.5.42, whose podspec requires sqlite3 ~> 3.52.0,
+      # so CocoaPods refuses to resolve. The two committed lockfiles drifted.
+      #
+      # Re-resolving on every run is non-deterministic; the regenerated lock is
+      # uploaded below so it can be committed, after which this step should be
+      # reduced to a plain `pod install` that verifies the lock is honoured.
+      - name: Sync CocoaPods lockfile
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          # Update only the conflicting pod so the rest of the graph stays pinned.
+          if ! pod update sqlite3 --repo-update; then
+            echo "::warning::Targeted 'pod update sqlite3' failed; re-resolving the full graph"
+            pod install --repo-update
+          fi
+
+      - name: Upload regenerated Podfile.lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-podfile-lock-${{ inputs.channel }}
+          if-no-files-found: error
+          retention-days: 14
+          path: ios/Podfile.lock
+
       - name: Build unsigned IPA
         env:
           CHANNEL: ${{ inputs.channel }}
